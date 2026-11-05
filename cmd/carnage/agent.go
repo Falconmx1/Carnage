@@ -19,6 +19,10 @@ var (
 	agentListenPort int
 	agentAdminIP    string
 	agentAdminPort  int
+
+	// agentCert se genera una vez al arrancar el comando "listen"
+	// y se reutiliza en cada conexión entrante.
+	agentCert tls.Certificate
 )
 
 var agentCmd = &cobra.Command{
@@ -39,6 +43,7 @@ var agentListenCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("error generando certificado: %w", err)
 		}
+		agentCert = cert // se reutiliza en handleAgentConn
 
 		addr := fmt.Sprintf("0.0.0.0:%d", agentListenPort)
 		ln, err := tls.Listen("tcp", addr, &tls.Config{
@@ -75,15 +80,105 @@ var agentListenCmd = &cobra.Command{
 	},
 }
 
+// handleAgentConn atiende una conexión entrante del Admin.
+// Hace el handshake TLS+AES, lee el mensaje del protocolo, lo descifra
+// y responde con un HandshakeOK cifrado.
 func handleAgentConn(conn net.Conn) {
 	defer conn.Close()
 
-	// Handshake TLS + derivación de clave AES
-	wrapped, gcm, err := transport.ServerHandshake(conn, conn.(*tls.Conn).ConnectionState().PeerCertificates[0].PublicKey.(interface{}).(interface{}) != nil && false || true && false || true && false || true && false || true && false || true && false || true && false || true && false || true && false)
-	_ = wrapped
-	_ = gcm
+	wrapped, gcm, err := transport.ServerHandshake(conn, agentCert)
 	if err != nil {
 		fmt.Printf("[-] Error en handshake con %s: %v\n", conn.RemoteAddr(), err)
 		return
 	}
+	defer wrapped.Close()
+
+	// 1. Leer el tipo de mensaje (1 byte)
+	wrapped.SetReadDeadline(time.Now().Add(10 * time.Second))
+	header := make([]byte, 1)
+	if _, err := wrapped.Read(header); err != nil {
+		fmt.Printf("[-] Error leyendo tipo de mensaje: %v\n", err)
+		return
+	}
+	msgType := protocol.MessageType(header[0])
+
+	// 2. Leer el payload cifrado (AES-GCM incluye nonce + ciphertext)
+	encBuf := make([]byte, 4096)
+	n, err := wrapped.Read(encBuf)
+	if err != nil {
+		fmt.Printf("[-] Error leyendo payload: %v\n", err)
+		return
+	}
+
+	// 3. Descifrar
+	plaintext, err := transport.Decrypt(gcm, encBuf[:n])
+	if err != nil {
+		fmt.Printf("[-] Error descifrando payload: %v\n", err)
+		return
+	}
+
+	fmt.Printf("[+] Admin conectado desde %s: tipo=%s payload=%q\n",
+		conn.RemoteAddr(), msgType, string(plaintext))
+
+	// 4. Responder con HandshakeOK cifrado
+	resp := protocol.NewHandshakeOK()
+	encResp, err := transport.Encrypt(gcm, resp.Payload)
+	if err != nil {
+		fmt.Printf("[-] Error cifrando respuesta: %v\n", err)
+		return
+	}
+	packet := make([]byte, 0, 1+len(encResp))
+	packet = append(packet, byte(resp.Type))
+	packet = append(packet, encResp...)
+	if _, err := wrapped.Write(packet); err != nil {
+		fmt.Printf("[-] Error enviando respuesta: %v\n", err)
+		return
+	}
+}
+
+// ---------- connect ----------
+
+var agentConnectCmd = &cobra.Command{
+	Use:   "connect",
+	Short: "Conectar al Admin (modo inverso)",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		addr := net.JoinHostPort(agentAdminIP, fmt.Sprintf("%d", agentAdminPort))
+
+		rawConn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+		if err != nil {
+			return fmt.Errorf("error conectando al admin %s: %w", addr, err)
+		}
+
+		conn, gcm, err := transport.ClientHandshake(rawConn)
+		if err != nil {
+			rawConn.Close()
+			return fmt.Errorf("error en handshake con %s: %w", addr, err)
+		}
+		defer conn.Close()
+
+		// Enviar handshake cifrado
+		hs := protocol.NewHandshake("carnage-agent")
+		enc, err := transport.Encrypt(gcm, hs.Payload)
+		if err != nil {
+			return fmt.Errorf("error cifrando handshake: %w", err)
+		}
+		packet := make([]byte, 0, 1+len(enc))
+		packet = append(packet, byte(hs.Type))
+		packet = append(packet, enc...)
+		if _, err := conn.Write(packet); err != nil {
+			return fmt.Errorf("error enviando handshake: %w", err)
+		}
+
+		// Esperar respuesta
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		buf := make([]byte, 4096)
+		n, err := conn.Read(buf)
+		if err != nil {
+			return fmt.Errorf("error leyendo respuesta: %w", err)
+		}
+		fmt.Printf("[+] Conectado al Admin %s. Respuesta (%d bytes): %x\n", addr, n, buf[:n])
+		fmt.Println("[+] Sesión activa. Ctrl+C para salir.")
+		waitForSignal()
+		return nil
+	},
 }
