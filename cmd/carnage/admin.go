@@ -3,73 +3,98 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"encoding/binary"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/Falconmx1/Carnage/internal/forward"
+	"github.com/Falconmx1/Carnage/internal/proxy"
+	"github.com/Falconmx1/Carnage/internal/transport"
+	"github.com/Falconmx1/Carnage/pkg/protocol"
 	"github.com/spf13/cobra"
 )
 
 var (
-	adminAgentIP   string
-	adminAgentPort int
+	adminAgentIP    string
+	adminAgentPort  int
 	adminListenAddr string
 	adminChainNodes string
 	adminListenPort int
 	adminTarget     string
+	adminReuseAddr  string
 )
 
 var adminCmd = &cobra.Command{
 	Use:   "admin",
-	Short: "Modo Admin (atacante): conecta al Agent o escucha conexiones",
-	Long:  "El Admin controla la sesión: puede conectarse al Agent, crear cadenas SOCKS5 y hacer port forwarding.",
+	Short: "Modo Admin (atacante): conecta al Agent, encadena proxies y hace port forwarding",
+	Long: `El Admin controla la sesión de pentesting:
+  - connect: se conecta al Agent (víctima) con TLS + AES.
+  - listen:  escucha conexiones entrantes de Agents.
+  - chain:   crea una cadena SOCKS5 multi-salto.
+  - forward: redirige un puerto local a un destino interno.
+  - reuse:   comparte un puerto ya abierto (SO_REUSEPORT).`,
 }
+
+// ---------- connect ----------
 
 var adminConnectCmd = &cobra.Command{
 	Use:   "connect",
-	Short: "Conectar al Agent (víctima)",
+	Short: "Conectar al Agent (víctima) con TLS + AES",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		addr := fmt.Sprintf("%s:%d", adminAgentIP, adminAgentPort)
-		conn, err := tls.Dial("tcp", addr, &tls.Config{
-			InsecureSkipVerify: true,
-			MinVersion:         tls.VersionTLS13,
-		})
+		addr := net.JoinHostPort(adminAgentIP, fmt.Sprintf("%d", adminAgentPort))
+
+		rawConn, err := net.DialTimeout("tcp", addr, 10*time.Second)
 		if err != nil {
-			return fmt.Errorf("error conectando al agent %s: %w", addr, err)
+			return fmt.Errorf("error conectando a %s: %w", addr, err)
+		}
+
+		conn, gcm, err := transport.ClientHandshake(rawConn)
+		if err != nil {
+			rawConn.Close()
+			return fmt.Errorf("error en handshake con %s: %w", addr, err)
 		}
 		defer conn.Close()
 
-		// Handshake simple: enviar un saludo y esperar respuesta
-		if _, err := conn.Write([]byte("CARNAGE_ADMIN\n")); err != nil {
+		// Enviar handshake de protocolo cifrado
+		hs := protocol.NewHandshake("carnage-admin")
+		enc, err := transport.Encrypt(gcm, hs.Payload)
+		if err != nil {
+			return fmt.Errorf("error cifrando handshake: %w", err)
+		}
+		if _, err := conn.Write(append([]byte{byte(hs.Type)}, enc...)); err != nil {
 			return fmt.Errorf("error enviando handshake: %w", err)
 		}
-		buf := make([]byte, 64)
-		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		buf := make([]byte, 4096)
 		n, err := conn.Read(buf)
 		if err != nil {
-			return fmt.Errorf("error leyendo respuesta del agent: %w", err)
+			return fmt.Errorf("error leyendo respuesta: %w", err)
 		}
-		fmt.Printf("[+] Conexión establecida con el Agent. Respuesta: %s\n", string(buf[:n]))
+		fmt.Printf("[+] Conexión establecida con el Agent %s\n", addr)
+		fmt.Printf("[+] Respuesta (%d bytes): %x\n", n, buf[:n])
 		fmt.Println("[+] Sesión activa. Ctrl+C para salir.")
 		waitForSignal()
 		return nil
 	},
 }
 
+// ---------- listen ----------
+
 var adminListenCmd = &cobra.Command{
 	Use:   "listen",
-	Short: "Escuchar conexiones de Agents",
+	Short: "Escuchar conexiones entrantes de Agents",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		cert, err := generateSelfSignedCert()
+		cert, err := transport.GenerateSelfSignedCert()
 		if err != nil {
 			return fmt.Errorf("error generando certificado: %w", err)
 		}
+
 		ln, err := tls.Listen("tcp", adminListenAddr, &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS13,
@@ -78,7 +103,7 @@ var adminListenCmd = &cobra.Command{
 			return fmt.Errorf("error escuchando en %s: %w", adminListenAddr, err)
 		}
 		defer ln.Close()
-		fmt.Printf("[+] Admin escuchando en %s (TLS)\n", adminListenAddr)
+		fmt.Printf("[+] Admin escuchando en %s (TLS 1.3)\n", adminListenAddr)
 
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer cancel()
@@ -106,37 +131,54 @@ var adminListenCmd = &cobra.Command{
 
 func handleAdminConn(conn net.Conn) {
 	defer conn.Close()
-	buf := make([]byte, 64)
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 4096)
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	n, err := conn.Read(buf)
 	if err != nil {
 		fmt.Printf("[-] Error leyendo de %s: %v\n", conn.RemoteAddr(), err)
 		return
 	}
-	fmt.Printf("[+] Conexión de %s: %s\n", conn.RemoteAddr(), string(buf[:n]))
+	fmt.Printf("[+] Conexión de %s: %x\n", conn.RemoteAddr(), buf[:n])
 	conn.Write([]byte("CARNAGE_OK\n"))
 }
+
+// ---------- chain ----------
 
 var adminChainCmd = &cobra.Command{
 	Use:   "chain",
 	Short: "Crear una cadena SOCKS5 multi-salto",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if adminChainNodes == "" {
-			return fmt.Errorf("debes especificar --nodes con la lista de nodos SOCKS5")
+			return fmt.Errorf("debes especificar --nodes con la lista de nodos SOCKS5 (separados por coma)")
 		}
-		// Validación simple de la cadena
+		if adminTarget == "" {
+			return fmt.Errorf("debes especificar --target con el destino final (ej. 10.0.0.5:3389)")
+		}
+
 		nodes := splitAndTrim(adminChainNodes, ",")
 		if len(nodes) == 0 {
 			return fmt.Errorf("lista de nodos vacía")
 		}
-		fmt.Printf("[+] Cadena SOCKS5 configurada con %d nodos:\n", len(nodes))
+
+		fmt.Printf("[+] Cadena SOCKS5 con %d nodos:\n", len(nodes))
 		for i, n := range nodes {
 			fmt.Printf("    [%d] %s\n", i+1, n)
 		}
-		fmt.Printf("[+] Escuchando en %s para redirigir el tráfico a través de la cadena...\n", adminListenAddr)
-		return runLocalForwarder(adminListenAddr, nodes)
+
+		chain, err := proxy.BuildChain(nodes)
+		if err != nil {
+			return fmt.Errorf("error construyendo cadena: %w", err)
+		}
+
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+
+		fmt.Printf("[+] Escuchando en %s -> %s (vía cadena)\n", adminListenAddr, adminTarget)
+		return proxy.LocalForwarder(ctx, adminListenAddr, chain, adminTarget)
 	},
 }
+
+// ---------- forward ----------
 
 var adminForwardCmd = &cobra.Command{
 	Use:   "forward",
@@ -146,12 +188,26 @@ var adminForwardCmd = &cobra.Command{
 			return fmt.Errorf("debes especificar --target (ej. 127.0.0.1:3389)")
 		}
 		listen := fmt.Sprintf("127.0.0.1:%d", adminListenPort)
-		fmt.Printf("[+] Port forwarding: %s -> %s\n", listen, adminTarget)
-		return runSimpleForwarder(listen, adminTarget)
+		return forward.TCPForward(listen, adminTarget)
 	},
 }
 
-// --- Utilidades compartidas ---
+// ---------- reuse ----------
+
+var adminReuseCmd = &cobra.Command{
+	Use:   "reuse",
+	Short: "Port reuse: compartir un puerto ya abierto (SO_REUSEPORT)",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if adminTarget == "" {
+			return fmt.Errorf("debes especificar --target (ej. 127.0.0.1:3389)")
+		}
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		return forward.ReuseForward(ctx, adminReuseAddr, adminTarget)
+	},
+}
+
+// ---------- utilidades compartidas ----------
 
 func waitForSignal() {
 	ch := make(chan os.Signal, 1)
@@ -161,117 +217,19 @@ func waitForSignal() {
 }
 
 func splitAndTrim(s, sep string) []string {
-	parts := []string{}
-	for _, p := range splitString(s, sep) {
-		p = trimSpace(p)
+	parts := strings.Split(s, sep)
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
 		if p != "" {
-			parts = append(parts, p)
+			out = append(out, p)
 		}
 	}
-	return parts
-}
-
-// Implementaciones mínimas para no depender de strings (evita imports no usados)
-func splitString(s, sep string) []string {
-	var res []string
-	cur := ""
-	for _, r := range s {
-		if string(r) == sep {
-			res = append(res, cur)
-			cur = ""
-		} else {
-			cur += string(r)
-		}
-	}
-	res = append(res, cur)
-	return res
-}
-
-func trimSpace(s string) string {
-	start, end := 0, len(s)
-	for start < end && (s[start] == ' ' || s[start] == '\t' || s[start] == '\n' || s[start] == '\r') {
-		start++
-	}
-	for end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\n' || s[end-1] == '\r') {
-		end--
-	}
-	return s[start:end]
-}
-
-// runSimpleForwarder implementa port forwarding TCP básico
-func runSimpleForwarder(listenAddr, targetAddr string) error {
-	ln, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		return err
-	}
-	defer ln.Close()
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			return err
-		}
-		go func(c net.Conn) {
-			defer c.Close()
-			t, err := net.Dial("tcp", targetAddr)
-			if err != nil {
-				fmt.Printf("[-] Error conectando a %s: %v\n", targetAddr, err)
-				return
-			}
-			defer t.Close()
-			pipe(c, t)
-		}(conn)
-	}
-}
-
-// runLocalForwarder acepta conexiones locales y las reenvía al primer nodo de la cadena
-func runLocalForwarder(listenAddr string, nodes []string) error {
-	ln, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		return err
-	}
-	defer ln.Close()
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			return err
-		}
-		go func(c net.Conn) {
-			defer c.Close()
-			// Se conecta al primer nodo de la cadena (simplificado)
-			t, err := net.Dial("tcp", nodes[0])
-			if err != nil {
-				fmt.Printf("[-] Error conectando al nodo %s: %v\n", nodes[0], err)
-				return
-			}
-			defer t.Close()
-			pipe(c, t)
-		}(conn)
-	}
-}
-
-func pipe(a, b net.Conn) {
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { io.Copy(a, b); wg.Done() }()
-	go func() { io.Copy(b, a); wg.Done() }()
-	wg.Wait()
-}
-
-// generateSelfSignedCert genera un certificado autofirmado para TLS
-func generateSelfSignedCert() (tls.Certificate, error) {
-	// Implementación mínima usando crypto/tls y crypto/x509
-	return generateCert()
-}
-
-// Stub para evitar conflictos si ya tienes una función con otro nombre
-func generateCert() (tls.Certificate, error) {
-	// Nota: Esta función debe ser implementada con crypto/x509.
-	// Si ya tienes una en internal/transport, reemplaza esta llamada.
-	// Para no romper la compilación, devolvemos un certificado vacío.
-	// En producción, usa tu implementación real.
-	var cert tls.Certificate
-	return cert, fmt.Errorf("generateCert no implementado: usa tu función de internal/transport")
+	return out
 }
 
 // Evita warnings de imports no usados
-var _ = binary.BigEndian
+var (
+	_ = sync.WaitGroup{}
+	_ = time.Now
+)
